@@ -20,9 +20,11 @@ OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_OLLAMA_MODEL = "llama3:8b"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
+DEFAULT_GROQ_MODEL = "qwen/qwen3.6-27b"
 MAX_COACH_WORDS = 100
 MAX_SUGGESTION_WORDS = 50
 OLLAMA_NUM_PREDICT = 150
@@ -186,6 +188,61 @@ class GeminiProvider(LLMProvider):
         return _read_json_response(request, self.timeout_seconds, "Gemini")
 
 
+class GroqProvider(LLMProvider):
+    """Groq Chat Completions API provider for EcoPilot coaching."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str = DEFAULT_GROQ_MODEL,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        """Initialize a Groq provider using the supplied API key."""
+
+        self.api_key = api_key
+        self.model = model
+        self.timeout_seconds = timeout_seconds
+
+    def generate(self, prompt: str) -> str:
+        """Generate a coaching message through the Groq Chat Completions API."""
+
+        response_body = self._post(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                "max_tokens": 220,
+                "temperature": 0.7,
+            }
+        )
+        message = _extract_groq_text(response_body)
+
+        if not message:
+            raise LLMProviderError("Groq response did not include coach text")
+
+        return message
+
+    def _post(self, request_body: Mapping[str, Any]) -> Dict[str, Any]:
+        """Send a JSON request to Groq and decode its response."""
+
+        request = Request(
+            GROQ_COMPLETIONS_URL,
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        return _read_json_response(request, self.timeout_seconds, "Groq")
+
+
+
 class LLMInsightGenerator:
     """Turn structured EcoPilot results into an optional coach explanation."""
 
@@ -195,14 +252,24 @@ class LLMInsightGenerator:
         *,
         openai_api_key: str | None = None,
         gemini_api_key: str | None = None,
+        groq_api_key: str | None = None,
     ) -> None:
         """Initialize a configured provider or deterministic local fallback."""
 
         self.providers = [provider] if provider is not None else select_llm_providers(
             openai_api_key=openai_api_key,
             gemini_api_key=gemini_api_key,
+            groq_api_key=groq_api_key,
         )
         self.provider = self.providers[0] if self.providers else None
+        self.selected_provider_name = (
+            self.provider.__class__.__name__ if self.provider else "TemplateProvider"
+        )
+        self.selected_model = (
+            getattr(self.provider, "model", "N/A")
+            if self.provider
+            else "N/A"
+        )
 
     def generate(
         self,
@@ -308,15 +375,19 @@ def select_llm_provider(
     *,
     openai_api_key: str | None = None,
     gemini_api_key: str | None = None,
+    groq_api_key: str | None = None,
 ) -> LLMProvider | None:
     """Select the highest-priority available LLM provider.
 
-    Provider priority is Ollama, OpenAI, Gemini, then the local template.
+    Provider priority:
+    - Local: Ollama, Groq, OpenAI, Gemini, then the local template.
+    - Cloud: Groq, OpenAI, Gemini, then the local template.
     """
 
     providers = select_llm_providers(
         openai_api_key=openai_api_key,
         gemini_api_key=gemini_api_key,
+        groq_api_key=groq_api_key,
     )
     return providers[0] if providers else None
 
@@ -325,13 +396,32 @@ def select_llm_providers(
     *,
     openai_api_key: str | None = None,
     gemini_api_key: str | None = None,
+    groq_api_key: str | None = None,
 ) -> list[LLMProvider]:
-    """Build available providers in Ollama, OpenAI, Gemini priority order."""
+    """Build available providers in priority order.
+    
+    Priority:
+    - Local dev: Ollama, Groq, OpenAI, Gemini
+    - Cloud: Groq, OpenAI, Gemini
+    """
 
     providers: list[LLMProvider] = []
+    
+    # Check if this is local development (Ollama available)
     ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
-    if is_ollama_model_available(ollama_model):
+    is_local_dev = is_ollama_model_available(ollama_model)
+    
+    if is_local_dev:
         providers.append(OllamaProvider(model=ollama_model))
+
+    groq_key = groq_api_key or os.getenv("GROQ_API_KEY")
+    if groq_key:
+        providers.append(
+            GroqProvider(
+                groq_key,
+                model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
+            )
+        )
 
     openai_key = openai_api_key or os.getenv("OPENAI_API_KEY")
     if openai_key:
@@ -649,6 +739,32 @@ def _extract_gemini_text(response_body: Mapping[str, Any]) -> str:
 
     return ""
 
+def _extract_groq_text(response_body: Mapping[str, Any]) -> str:
+    """Extract generated text from a Groq Chat Completions response."""
+
+    choices = response_body.get("choices")
+
+    if not isinstance(choices, Sequence) or isinstance(
+        choices,
+        (str, bytes),
+    ):
+        return ""
+
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+
+        message = choice.get("message")
+
+        if not isinstance(message, Mapping):
+            continue
+
+        content = message.get("content")
+
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+
+    return ""
 
 def _format_carbon_grams(carbon_result: Mapping[str, Any]) -> str:
     """Format a precomputed carbon result for a no-calculation prompt."""
